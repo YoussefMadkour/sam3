@@ -3,10 +3,14 @@
 """Tests that batched grounding covers every frame scheduled by propagation (#618)."""
 
 import unittest
+from functools import partial
 from unittest.mock import MagicMock
 
 from sam3.model.sam3_multiplex_detector import Sam3MultiplexDetector
-from sam3.model.sam3_multiplex_tracking import Sam3MultiplexTracking
+from sam3.model.sam3_multiplex_tracking import (
+    Sam3MultiplexTracking,
+    Sam3MultiplexTrackingProd,
+)
 
 
 def _processing_order(start_frame_idx, max_frame_num_to_track, num_frames, reverse):
@@ -62,6 +66,60 @@ def _grounded_chunks(
     return chunk_keys
 
 
+class _StopPropagation(Exception):
+    pass
+
+
+def _propagate_and_ground(
+    tracker_cls, prompt_frame, max_frame_num_to_track, num_frames, reverse, batch_size
+):
+    """Call `propagate_in_video` without a start frame, then ground every scheduled
+    frame using the tracking bounds it stored for the detector."""
+    tracker = MagicMock()
+    tracker.rank = 0
+    tracker.masklet_confirmation_consecutive_det_thresh = 1
+    tracker._get_processing_order = partial(
+        Sam3MultiplexTracking._get_processing_order, tracker
+    )
+    tracker._default_start_frame_idx = partial(
+        Sam3MultiplexTracking._default_start_frame_idx, tracker
+    )
+    previous_stages_out = [None] * num_frames
+    previous_stages_out[prompt_frame] = object()
+    inference_state = {
+        "num_frames": num_frames,
+        "previous_stages_out": previous_stages_out,
+        "feature_cache": {},
+    }
+    order, _ = tracker._get_processing_order(
+        inference_state, None, max_frame_num_to_track, reverse
+    )
+
+    def run_frames(state, frame_idx, reverse, **kwargs):
+        bounds = state["feature_cache"]["tracking_bounds"]
+        _grounded_chunks(
+            order,
+            bounds["propagate_in_video_start_frame_idx"],
+            bounds["max_frame_num_to_track"],
+            num_frames,
+            reverse,
+            batch_size,
+        )
+        raise _StopPropagation
+
+    tracker._run_single_frame_inference.side_effect = run_frames
+    frames = tracker_cls.propagate_in_video(
+        tracker,
+        inference_state,
+        max_frame_num_to_track=max_frame_num_to_track,
+        reverse=reverse,
+    )
+    try:
+        next(frames)
+    except _StopPropagation:
+        pass
+
+
 class TestBatchedGroundingBounds(unittest.TestCase):
     def test_forward_bound_has_no_empty_chunk(self) -> None:
         # Repro from #618: 16 frames, batch size 1, max_frame_num_to_track=15
@@ -98,6 +156,26 @@ class TestBatchedGroundingBounds(unittest.TestCase):
                             for chunk_start, chunk_end in chunks:
                                 self.assertLess(chunk_start, chunk_end)
                                 self.assertLessEqual(chunk_end, num_frames)
+
+    def test_default_start_frame_is_used_for_grounding(self) -> None:
+        # Prompt on a later frame and propagate without `start_frame_index`:
+        # grounding must use the same start frame as the tracker.
+        for tracker_cls in (Sam3MultiplexTracking, Sam3MultiplexTrackingProd):
+            for reverse in (False, True):
+                for batch_size in (1, 16):
+                    with self.subTest(
+                        tracker_cls=tracker_cls.__name__,
+                        reverse=reverse,
+                        batch_size=batch_size,
+                    ):
+                        _propagate_and_ground(
+                            tracker_cls,
+                            prompt_frame=10,
+                            max_frame_num_to_track=5,
+                            num_frames=20,
+                            reverse=reverse,
+                            batch_size=batch_size,
+                        )
 
 
 if __name__ == "__main__":
